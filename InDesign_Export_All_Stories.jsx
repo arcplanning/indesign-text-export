@@ -76,15 +76,21 @@ function repeat(str, times) {
 
 function cleanSpecialCharacters(content) {
   // Replace right indent tab (Unicode 0x0019) with space
-  // This is the special tab used in InDesign ToCs between entry and page number
   content = content.replace(/\u0019/g, " ");
   
-  // Replace regular tab characters with spaces
+  // Replace regular tab characters with spaces  
   content = content.replace(/\t/g, " ");
   
-  // Replace any remaining unprintable characters with XXX as fallback
-  // These might be cross-reference markers that weren't resolved
-  content = content.replace(/[\u0000-\u001F\u007F-\u009F\uFEFF\uFFFC\uFFFD]/g, "XXX");
+  // Handle unprintable characters contextually:
+  // If preceded by "page " or "Page ", replace with XXX (cross-reference)
+  // Otherwise, remove them (likely footnote markers or other unwanted markers)
+  
+  // First, replace unprintable chars after "page " with XXX
+  content = content.replace(/(\b[Pp]age\s+)[\u0000-\u0008\u000B-\u000C\u000E-\u001F\uFFFC\uFEFF\uFFFE\uFFFF]/g, "$1XXX");
+  
+  // Then remove all remaining unprintable characters
+  // Exclude: tab (09), line feed (0A), carriage return (0D)
+  content = content.replace(/[\u0000-\u0008\u000B-\u000C\u000E-\u001F\uFFFC\uFEFF\uFFFE\uFFFF]/g, "");
   
   // Clean up multiple consecutive spaces
   content = content.replace(/  +/g, " ");
@@ -92,9 +98,10 @@ function cleanSpecialCharacters(content) {
   return content;
 }
 
+
 /**
- * Processes paragraph content to resolve cross-references to their displayed values.
- * InDesign cross-references have a resultText property that contains the resolved value.
+ * Processes paragraph content to get the displayed text with cross-references resolved.
+ * Uses InDesign's own text resolution rather than trying to manually replace characters.
  *
  * @param {Paragraph} para - The InDesign paragraph object.
  * @returns {string} The paragraph content with cross-references resolved.
@@ -103,44 +110,43 @@ function getContentWithResolvedCrossRefs(para) {
   var content = "";
   
   try {
-	// Try to access cross-reference sources in the paragraph
-	var xrefs = para.crossReferenceSources;
-	
-	if (xrefs && xrefs.length > 0) {
-	  // If there are cross-references, build content by walking through text
-	  // and replacing cross-ref markers with their resultText
-	  content = para.contents;
-	  
-	  // Process cross-references in reverse order to maintain correct positions
-	  for (var i = xrefs.length - 1; i >= 0; i--) {
-		var xref = xrefs[i];
+	// Try to get the text as it appears visually in InDesign
+	// This should include resolved cross-references
+	if (para.texts && para.texts.length > 0) {
+	  // Build content from text runs, which have cross-refs resolved
+	  for (var t = 0; t < para.texts.length; t++) {
 		try {
-		  // Get the actual displayed text of the cross-reference
-		  var resolvedText = xref.resultText || "XXX";
-		  
-		  // Get the position of this cross-ref in the paragraph
-		  var xrefStart = xref.storyOffset.index - para.storyOffset.index;
-		  var xrefLength = xref.length;
-		  
-		  // Replace the cross-ref marker with the resolved text
-		  content = content.substring(0, xrefStart) + 
-				   resolvedText + 
-				   content.substring(xrefStart + xrefLength);
+		  var textItem = para.texts[t];
+		  // Check if this is a cross-reference
+		  if (textItem.crossReferenceSources && textItem.crossReferenceSources.length > 0) {
+			// Get the resolved text from the cross-reference
+			var xref = textItem.crossReferenceSources[0];
+			content += (xref.resultText || "XXX");
+		  } else {
+			// Normal text
+			content += textItem.contents;
+		  }
 		} catch (e) {
-		  // If we can't resolve this particular cross-ref, leave it as-is
+		  // If we can't process this text item, try getting its contents
+		  try {
+			content += para.texts[t].contents;
+		  } catch (e2) {
+			// Skip this text item
+		  }
 		}
 	  }
 	} else {
-	  // No cross-references, just return normal contents
+	  // Fallback to simple contents
 	  content = para.contents;
 	}
   } catch (e) {
-	// If cross-reference access fails, fall back to normal contents
+	// If everything fails, use basic contents
 	content = para.contents;
   }
   
   return content;
 }
+
 
 /**
  * Checks if a marker is a bullet character (not a number).
@@ -340,9 +346,9 @@ function showExportDialog() {
 			staticTexts.add({ staticLabel: "Export as:" });
 			formatButtons = radiobuttonGroups.add();
 			with (formatButtons) {
-			  radiobuttonControls.add({ staticLabel: "Markdown (md)" });
-			  radiobuttonControls.add({ staticLabel: "Plain Only (txt)" });
 			  radiobuttonControls.add({ staticLabel: "Rich Text (rtf)" });
+			  radiobuttonControls.add({ staticLabel: "Plain Text (txt)" });
+			  radiobuttonControls.add({ staticLabel: "Markdown (md)" });
 			  radiobuttonControls.add({ staticLabel: "InDesign Tagged Text (txt)" });
 			}
 		  }
