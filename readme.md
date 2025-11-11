@@ -1,6 +1,6 @@
 # InDesign Export All Stories
 
-An Adobe InDesign JavaScript script to export all stories from a document as plain text.
+An [Adobe InDesign](https://www.adobe.com/products/indesign.html) JavaScript script to export all stories from a document as plain text.
 
 ## Description
 
@@ -42,12 +42,12 @@ Plain text ensures portability across systems without proprietary dependencies, 
    
 ![Export Optionsl](reference/indesign-export-options.png)  
    
-4. Click **Save** to export.
+4. Click **OK** to export.
 5. Review the output file for accuracy (structure detection is best-effort).
 
 ![Scripts Panel](reference/exported-basic-text.png)
 
-Your original InDesign document remains unchanged.  This script just generates a minimalistic copy for external use.
+Your original InDesign document remains unchanged.  This script just generates a minimalistic text version for external use.
 
 
 ## Notes
