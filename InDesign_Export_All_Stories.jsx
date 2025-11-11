@@ -2,11 +2,12 @@
 ExportAllStories.jsx
 
 An InDesign JavaScript to export all stories.
-Author: Adobe Systems, Inc.
-Revision: Architectural Research Consultants, Incorporated
+Copyright © 2009 Adobe Systems Incorporated.
+https://console.adobe.io/downloads/id
+Revision: Architectural Research Consultants, Incorporated under Adobe SDK License + MIT.
 
 Date: 2025-09-30
-Revised: 2025-11-07
+Revised: 2025-11-11
 
 Update of Adobe's default script called "ExportAllStories.jsx".
 Exports all stories in an InDesign document in a specified text format.
