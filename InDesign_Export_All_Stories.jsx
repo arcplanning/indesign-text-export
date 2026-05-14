@@ -955,7 +955,7 @@ function showExportDialog() {
 	var lastPreserve = app.extractLabel("exportStories.preserveNumbering");
 	if (lastPreserve === "") lastPreserve = "1";
 	var lastSingleFile = app.extractLabel("exportStories.singleFile");
-	if (lastSingleFile === "") lastSingleFile = "0";
+	if (lastSingleFile === "") lastSingleFile = "1";
 	var lastIncludeTables = app.extractLabel("exportStories.includeTables");
 	if (lastIncludeTables === "") lastIncludeTables = "1";
 	var lastTableCaptions = app.extractLabel("exportStories.tableCaptions");
@@ -964,8 +964,8 @@ function showExportDialog() {
 	var lastDoc = app.extractLabel("exportStories.lastDoc");
 	var lastPath = app.extractLabel("exportStories.lastPath");
 	var docName = app.activeDocument.name.replace(/\.indd$/i, "");
-	if (lastPath === "" || lastDoc !== docName || !new Folder(lastPath).parent.exists) {
-		lastPath = Folder.desktop.fsName + "/" + docName + "_Export";
+	if (lastPath === "" || lastDoc !== docName || !new Folder(lastPath).exists) {
+		lastPath = Folder.desktop.fsName;
 	}
 
 	var dialog = app.dialogs.add({ name: "Export All Stories" });
