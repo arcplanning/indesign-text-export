@@ -40,7 +40,7 @@ Plain text ensures portability across systems without proprietary dependencies, 
    - **Text (txt)**: Pure plain text.
    - **Markdown (md)**: Retains detected structure like headings and lists for enhanced readability.
    
-![Export Optionsl](reference/indesign-export-options.png)  
+![Export Options](reference/indesign-export-options.png)  
    
 4. Click **OK** to export.
 5. Review the output file for accuracy (structure detection is best-effort).

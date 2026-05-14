@@ -117,7 +117,7 @@ function toArray(a) {
 function cleanSpecialCharacters(content) {
 	content = content.replace(/\u0019/g, " "); // right indent tab
 	content = content.replace(/\t/g, " ");     // tabs -> spaces (paragraph text only)
-	content = content.replace(/(\b[Pp]age\s+)[\u0000-\u0008\u000B-\u000C\u000E-\u001F\uFFFC\uFEFF\uFFFE\uFFFF]/g, "$1XXX");
+	content = content.replace(/(\b[Pp]age\s+)[\u0000-\u0008\u000B-\u000C\u000E-\u001F\uFFFC\uFEFF\uFFFE\uFFFF]/g, "$1[#]");
 	content = content.replace(/[\u0000-\u0008\u000B-\u000C\u000E-\u001F\uFFFC\uFEFF\uFFFE\uFFFF]/g, "");
 	content = content.replace(/ +/g, " ");
 	return content;
@@ -138,7 +138,7 @@ function getContentWithResolvedCrossRefs(para) {
 					var ti = para.texts[t];
 					if (ti.crossReferenceSources && ti.crossReferenceSources.length > 0) {
 						var x = ti.crossReferenceSources[0];
-						content += (x.resultText || "XXX");
+						content += (x.resultText || "[unresolved]");
 					} else {
 						content += ti.contents;
 					}
@@ -858,8 +858,8 @@ function emitAllTablesForStory(builder, storyId, tablesByStoryId, emittedTableId
  */
 function initializeScript() {
 	app.scriptPreferences.userInteractionLevel = UserInteractionLevels.interactWithAll;
-	if (app.documents.length != 0) {
-		if (app.activeDocument.stories.length != 0) {
+	if (app.documents.length !== 0) {
+		if (app.activeDocument.stories.length !== 0) {
 			showExportDialog();
 		} else {
 			alert("The document does not contain any text. Please open a document containing text and try again.");
@@ -1077,7 +1077,7 @@ function showExportDialog() {
 			}
 		}
 
-		if (app.activeDocument.stories.length != 0) {
+		if (app.activeDocument.stories.length !== 0) {
 			exportStories(exportFormat, outFolder, minWordCount, minFrameSize, preserveNumbering, singleFile, includeTables, prettyMarkdown, tableCaptions);
 		}
 	} else {
