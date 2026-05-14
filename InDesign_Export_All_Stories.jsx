@@ -26,19 +26,19 @@ Key Features:
 */
 
 // -----------------------
-// Global Variables
+// Constants
 // -----------------------
-/**
- * Index of all tables in the document, sorted by story and position.
- * Structure: Array of objects {table, tableId, storyId, storyOffset, pageName, top, left}
- */
-var __ALL_TABLES_INDEX__ = null;
+var FORMAT_RTF          = 0;
+var FORMAT_PLAIN_TEXT   = 1;
+var FORMAT_MARKDOWN     = 2;
+var FORMAT_TAGGED_TEXT  = 3;
 
-/**
- * Set to track which table IDs have already been emitted to avoid duplicates.
- * Structure: Object { tableId: true }
- */
-var __EMITTED_TABLE_IDS__ = null;
+// -----------------------
+// Globals
+// -----------------------
+var __ALL_TABLES_INDEX__    = null; // [{table, tableId, storyId, storyOffset, pageName, top, left}]
+var __TABLES_BY_STORY_ID__  = null; // { storyId: [rec, ...] } -- same recs as above, bucketed
+var __EMITTED_TABLE_IDS__   = null; // { tableId: true }
 
 // -----------------------
 // Utility Functions
@@ -171,24 +171,41 @@ function isBulletMarker(marker) {
 	return false;
 }
 
+// One pass over the story; -1 marks "not a list item" so findMinListIndent can ignore it.
+function precomputeListIndents(story) {
+	var paras = story.paragraphs;
+	var n = paras.length;
+	var indents = [];
+	for (var i = 0; i < n; i++) {
+		var para = paras[i];
+		var prev = i > 0 ? paras[i - 1] : null;
+		var next = i < n - 1 ? paras[i + 1] : null;
+		var isList = false;
+		try { isList = isStructuralListItem(para, prev, next) || para.bulletsAndNumberingResultText.length > 0; } catch(e) {}
+		if (isList) {
+			var li = 0; try { li = para.leftIndent; } catch(e2) {}
+			indents.push(li);
+		} else indents.push(-1);
+	}
+	return indents;
+}
+
 /**
- * Finds the minimum left indent in nearby paragraphs to establish list baseline.
+ * Finds the minimum left indent in nearby list items to establish list baseline.
  * Scans 5 paras before/after for context.
- * @param {Object} story - InDesign story object.
+ * @param {Array} listIndents - Precomputed indent array (-1 for non-list items).
  * @param {number} startIndex - Paragraph index to start from.
  * @returns {number} Minimum indent or 0.
  */
-function findMinListIndent(story, startIndex) {
-	var minIndent = 999999;
-	for (var i = Math.max(0, startIndex - 5); i < Math.min(story.paragraphs.length, startIndex + 6); i++) {
-		var para = story.paragraphs[i];
-		var prev = i > 0 ? story.paragraphs[i - 1] : null;
-		var next = i < story.paragraphs.length - 1 ? story.paragraphs[i + 1] : null;
-		if (isStructuralListItem(para, prev, next) || para.bulletsAndNumberingResultText.length > 0) {
-			if (para.leftIndent < minIndent) minIndent = para.leftIndent;
-		}
+function findMinListIndent(listIndents, startIndex) {
+	var min = 999999;
+	var lo = Math.max(0, startIndex - 5);
+	var hi = Math.min(listIndents.length, startIndex + 6);
+	for (var i = lo; i < hi; i++) {
+		var v = listIndents[i];
+		if (v !== -1 && v < min) min = v;
 	}
-	return minIndent === 999999 ? 0 : minIndent;
+	return min === 999999 ? 0 : min;
 }
 
 /**
@@ -365,26 +382,8 @@ function tableToTSV_Robust(tbl) {
 
 			grid[rr][cc] = getCellResolvedText_Safe(cell);
 
-			// Handle row/column spans by marking spanned cells as empty
-			var rs = 1, cs = 1;
-			try {
-				rs = Math.max(1, cell.rowSpan);
-			} catch (eRS) {}
-			try {
-				cs = Math.max(1, cell.columnSpan);
-			} catch (eCS) {}
-			if (rs > 1 || cs > 1) {
-				hasSpans = true;
-				for (var dr = 0; dr < rs; dr++) {
-					for (var dc = 0; dc < cs; dc++) {
-						if (dr === 0 && dc === 0) continue;
-						var rfill = rr + dr, cfill = cc + dc;
-						if (rfill >= 0 && rfill < totalRows && cfill >= 0 && cfill < cols) {
-							if (grid[rfill][cfill] === "") grid[rfill][cfill] = "";
-						}
-					}
-				}
-			}
+			var rs = 1, cs = 1; try { rs = Math.max(1, cell.rowSpan); } catch(eRS) {} try { cs = Math.max(1, cell.columnSpan); } catch(eCS) {}
+			if (rs > 1 || cs > 1) hasSpans = true;
 		}
 	}
 
@@ -505,50 +504,43 @@ function tsvToMarkdownTable(lines) {
 
 /**
  * Renders a table pack as Markdown or TSV block.
- * For Markdown: pretty table, optional caption (disabled).
- * For TSV: wrapped block with meta always included.
+ * For Markdown: pretty table. For TSV: wrapped block with optional meta.
  * @param {Object} pack - {meta, lines} from tableToTSV_Robust.
  * @param {boolean} prettyMarkdown - Use Markdown rendering.
+ * @param {boolean} tableCaptions - Include table meta in TSV blocks.
  * @returns {string} Rendered block.
  */
-function renderTableBlockMarkdown(pack, prettyMarkdown) {
-	// TSV fallback: always include meta
+function renderTableBlockMarkdown(pack, prettyMarkdown, tableCaptions) {
 	if (!prettyMarkdown) {
-		var meta = pack.meta && pack.meta.length > 0 ? (pack.meta.join("\n") + "\n") : "";
+		var meta = (tableCaptions && pack.meta && pack.meta.length > 0) ? (pack.meta.join("\n") + "\n") : "";
 		var body = pack.lines.join("\n") + "\n";
 		return "[TABLE-TSV-BEGIN]\n" + meta + body + "[TABLE-TSV-END]\n\n";
 	}
-	// Pretty Markdown: optional caption line (currently disabled)
-	var caption = "";
-	// if (tableCaptions) {
-	//     var m0 = pack.meta[0] || "", m1 = pack.meta[1] || "", m2 = pack.meta[2] || "";
-	//     caption = m0 + " • " + m1 + (m2 ? (" • " + m2) : "");
-	// }
 	var md = "";
-	if (caption.length > 0) md += caption + "\n\n";
 	md += tsvToMarkdownTable(pack.lines);
 	return md;
 }
 
 /**
- * Emits all tables for a specific story to the builder (Markdown mode).
- * Skips already emitted tables.
+ * Emits tables for a story as Markdown blocks (Markdown export path).
+ * Skips already emitted tables. Uses bucketed lookup for performance.
  * @param {Object} builder - {str: string} to append to.
  * @param {string} storyId - ID of the story.
- * @param {Array} allTables - Global table index.
+ * @param {Object} tablesByStoryId - Bucketed table lookup { storyId: [rec, ...] }.
  * @param {Object} emittedTableIds - Tracked emitted IDs.
  * @param {boolean} prettyMarkdown - Use pretty rendering.
+ * @param {boolean} tableCaptions - Include table captions/meta.
  * @returns {boolean} True if any tables emitted.
  */
-function emitTablesForStory_MD(builder, storyId, allTables, emittedTableIds, prettyMarkdown) {
+function emitTablesForStory_MD(builder, storyId, tablesByStoryId, emittedTableIds, prettyMarkdown, tableCaptions) {
 	var wrote = false;
-	for (var i = 0; i < allTables.length; i++) {
-		var rec = allTables[i];
-		if (rec.storyId !== storyId) continue;
+	var list = tablesByStoryId[storyId] || [];
+	for (var i = 0; i < list.length; i++) {
+		var rec = list[i];
 		if (emittedTableIds[rec.tableId]) continue;
 
 		var pack = tableToTSV_Robust(rec.table);
-		var mdBlock = renderTableBlockMarkdown(pack, prettyMarkdown);
+		var mdBlock = renderTableBlockMarkdown(pack, prettyMarkdown, tableCaptions);
 		if (builder.str.length > 0 && builder.str.substr(-2) !== "\n\n") builder.str += "\n";
 		builder.str += mdBlock;
 
@@ -667,33 +659,63 @@ function collectAllTables(doc) {
 	return all;
 }
 
+/**
+ * Buckets a flat table index by storyId for O(1) per-story lookup.
+ * @param {Array} allTables - Flat table index from collectAllTables.
+ * @returns {Object} { storyId: [rec, ...] }
+ */
+function bucketTablesByStoryId(allTables) {
+	var bucket = {};
+	for (var i = 0; i < allTables.length; i++) {
+		var rec = allTables[i];
+		if (!bucket[rec.storyId]) bucket[rec.storyId] = [];
+		bucket[rec.storyId].push(rec);
+	}
+	return bucket;
+}
+
 // -----------------------
 // Story Content Building and Export Functions
 // -----------------------
 /**
+ * Writes a string to a UTF-8 file (opens, writes, closes).
+ * @param {Object} outputFile - InDesign File object.
+ * @param {string} s - Content to write.
+ */
+function writeStringToFile(outputFile, s) {
+	outputFile.open("w"); outputFile.encoding = "UTF-8"; outputFile.write(s); outputFile.close();
+}
+
+/**
  * Builds Markdown content for a story: paragraphs with styles, lists, headings, tables.
- * Handles spacing, prefixes, nesting.
- * Tries to emit tables inline, falls back to end.
+ * Handles spacing, prefixes, nesting. Emits tables inline, falls back to end.
  * @param {Object} story - InDesign story.
  * @param {boolean} preserveNumbering - Use actual markers.
  * @param {boolean} prettyMarkdown - Enable pretty tables.
+ * @param {boolean} tableCaptions - Include table captions/meta.
  * @returns {string} Markdown content.
  */
-function buildMarkdownStoryContent(story, preserveNumbering, prettyMarkdown) {
+function buildStoryAsMarkdown(story, preserveNumbering, prettyMarkdown, tableCaptions) {
 	var builder = { str: "" };
 	var prevWasHeading = false;
 
-	var allTables = __ALL_TABLES_INDEX__ || [];
+	var tablesByStoryId = __TABLES_BY_STORY_ID__ || {};
 	var emittedTableIds = __EMITTED_TABLE_IDS__ || {};
+	var hasAnyTables    = !!__ALL_TABLES_INDEX__ && __ALL_TABLES_INDEX__.length > 0;
 
-	var wroteTables = (allTables.length > 0) ? emitTablesForStory_MD(builder, "" + story.id, allTables, emittedTableIds, prettyMarkdown) : false;
+	var wroteTables = hasAnyTables
+		? emitTablesForStory_MD(builder, "" + story.id, tablesByStoryId, emittedTableIds, prettyMarkdown, tableCaptions)
+		: false;
 
-	for (var i = 0; i < story.paragraphs.length; i++) {
-		var para = story.paragraphs[i];
-		if (para.contents.length == 0) continue;
+	var paras = story.paragraphs;
+	var listIndents = precomputeListIndents(story);
 
-		var prev = i > 0 ? story.paragraphs[i - 1] : null;
-		var next = i < story.paragraphs.length - 1 ? story.paragraphs[i + 1] : null;
+	for (var i = 0; i < paras.length; i++) {
+		var para = paras[i];
+		if (para.contents.length === 0) continue;
+
+		var prev = i > 0 ? paras[i - 1] : null;
+		var next = i < paras.length - 1 ? paras[i + 1] : null;
 		var style = classifyParagraphStyle(para);
 		var structural = isStructuralListItem(para, prev, next);
 		var prefix = "";
@@ -704,7 +726,7 @@ function buildMarkdownStoryContent(story, preserveNumbering, prettyMarkdown) {
 			prefix = repeat("#", style.level) + " ";
 			prevWasHeading = true;
 		} else if (structural || style.type === "bullet" || style.type === "numbered") {
-			var mi = findMinListIndent(story, i);
+			var mi = findMinListIndent(listIndents, i);
 			var nesting = getListNestingLevel(para, mi);
 			var ind = repeat("\t", nesting);
 			if (preserveNumbering && para.bulletsAndNumberingResultText.length > 0) {
@@ -722,15 +744,12 @@ function buildMarkdownStoryContent(story, preserveNumbering, prettyMarkdown) {
 
 		var content = cleanSpecialCharacters(getContentWithResolvedCrossRefs(para));
 		var line = prefix + content.replace(/\r$/, "");
-		if (line.replace(/^\s+|\s+$/g, "").length == 0) continue;
+		if (line.replace(/^\s+|\s+$/g, "").length === 0) continue;
 
 		builder.str += isListForSpacing ? (line + "\n") : (line + "\n\n");
 	}
 
-	if (allTables.length > 0 && !wroteTables) {
-		emitTablesForStory_MD(builder, "" + story.id, allTables, emittedTableIds, prettyMarkdown);
-	}
-
+	if (hasAnyTables && !wroteTables) emitTablesForStory_MD(builder, "" + story.id, tablesByStoryId, emittedTableIds, prettyMarkdown, tableCaptions);
 	return builder.str;
 }
 
@@ -740,52 +759,44 @@ function buildMarkdownStoryContent(story, preserveNumbering, prettyMarkdown) {
  * @param {Object} outputFile - File object.
  * @param {boolean} preserveNumbering - Preserve markers.
  * @param {boolean} prettyMarkdown - Pretty tables.
+ * @param {boolean} tableCaptions - Include table captions/meta.
  */
-function exportStoryAsMarkdown(story, outputFile, preserveNumbering, prettyMarkdown) {
-	var content = buildMarkdownStoryContent(story, preserveNumbering, prettyMarkdown);
-	outputFile.open("w");
-	outputFile.encoding = "UTF-8";
-	outputFile.write(content);
-	outputFile.close();
-}
-
-/**
- * Gets Markdown content for a story (no file write).
- * @see buildMarkdownStoryContent
- */
-function getStoryContentAsMarkdown(story, preserveNumbering, prettyMarkdown) {
-	return buildMarkdownStoryContent(story, preserveNumbering, prettyMarkdown);
+function exportStoryAsMarkdown(story, outputFile, preserveNumbering, prettyMarkdown, tableCaptions) {
+	writeStringToFile(outputFile, buildStoryAsMarkdown(story, preserveNumbering, prettyMarkdown, tableCaptions));
 }
 
 /**
  * Builds Plain Text content for a story: paragraphs with list prefixes, tables as TSV.
- * Simpler than Markdown, uses double newlines for paras, single for lists.
+ * Simpler than Markdown; uses double newlines for paras, single for lists.
  * @param {Object} story - InDesign story.
  * @param {boolean} preserveNumbering - Use actual markers.
+ * @param {boolean} tableCaptions - Include table captions/meta.
  * @returns {string} Plain text content.
  */
-function buildPlainTextStoryContent(story, preserveNumbering) {
+function buildStoryAsPlainText(story, preserveNumbering, tableCaptions) {
 	var builder = { str: "" };
 
-	var allTables = __ALL_TABLES_INDEX__ || [];
+	var tablesByStoryId = __TABLES_BY_STORY_ID__ || {};
 	var emittedTableIds = __EMITTED_TABLE_IDS__ || {};
+	var hasAnyTables    = !!__ALL_TABLES_INDEX__ && __ALL_TABLES_INDEX__.length > 0;
 
-	var wroteTables = (allTables.length > 0) ? emitAllTablesForStory(builder, false, "" + story.id, allTables, emittedTableIds) : false;
+	var wroteTables = hasAnyTables
+		? emitAllTablesForStory(builder, "" + story.id, tablesByStoryId, emittedTableIds, tableCaptions)
+		: false;
 
-	for (var i = 0; i < story.paragraphs.length; i++) {
-		var para = story.paragraphs[i];
+	var paras = story.paragraphs;
+	for (var i = 0; i < paras.length; i++) {
+		var para = paras[i];
 		var content = cleanSpecialCharacters(getContentWithResolvedCrossRefs(para));
-		if (content.replace(/^\s+|\s+$/g, "").length == 0) continue;
+		if (content.replace(/^\s+|\s+$/g, "").length === 0) continue;
 
-		var prev = i > 0 ? story.paragraphs[i - 1] : null;
-		var next = i < story.paragraphs.length - 1 ? story.paragraphs[i + 1] : null;
+		var prev = i > 0 ? paras[i - 1] : null;
+		var next = i < paras.length - 1 ? paras[i + 1] : null;
 		var style = classifyParagraphStyle(para);
 		var structural = isStructuralListItem(para, prev, next);
 		var listPrefix = "";
 
-		if (preserveNumbering && para.bulletsAndNumberingResultText.length > 0) {
-			listPrefix = para.bulletsAndNumberingResultText;
-		}
+		if (preserveNumbering && para.bulletsAndNumberingResultText.length > 0) listPrefix = para.bulletsAndNumberingResultText;
 
 		var line = listPrefix + content.replace(/\r$/, "");
 		var isListItem = (preserveNumbering && para.bulletsAndNumberingResultText.length > 0)
@@ -795,11 +806,8 @@ function buildPlainTextStoryContent(story, preserveNumbering) {
 		builder.str += isListItem ? (line + "\n") : (line + "\n\n");
 	}
 
-	if (allTables.length > 0 && !wroteTables) {
-		emitAllTablesForStory(builder, false, "" + story.id, allTables, emittedTableIds);
-	}
+	if (hasAnyTables && !wroteTables) emitAllTablesForStory(builder, "" + story.id, tablesByStoryId, emittedTableIds, tableCaptions);
 	builder.str = builder.str.replace(/\n+$/, "");
-
 	return builder.str;
 }
 
@@ -808,41 +816,30 @@ function buildPlainTextStoryContent(story, preserveNumbering) {
  * @param {Object} story - InDesign story.
  * @param {Object} outputFile - File object.
  * @param {boolean} preserveNumbering - Preserve markers.
+ * @param {boolean} tableCaptions - Include table captions/meta.
  */
-function exportStoryAsPlainText(story, outputFile, preserveNumbering) {
-	var content = buildPlainTextStoryContent(story, preserveNumbering);
-	outputFile.open("w");
-	outputFile.encoding = "UTF-8";
-	outputFile.write(content);
-	outputFile.close();
+function exportStoryAsPlainText(story, outputFile, preserveNumbering, tableCaptions) {
+	writeStringToFile(outputFile, buildStoryAsPlainText(story, preserveNumbering, tableCaptions));
 }
 
 /**
- * Gets Plain Text content for a story (no file write).
- * @see buildPlainTextStoryContent
- */
-function getStoryContentAsPlainText(story, preserveNumbering) {
-	return buildPlainTextStoryContent(story, preserveNumbering);
-}
-
-/**
- * Emits tables for a story as TSV blocks (legacy for Plain Text).
- * Always includes meta.
+ * Emits tables for a story as TSV blocks (Plain Text export path).
+ * Uses bucketed lookup; optionally includes meta based on tableCaptions flag.
  * @param {Object} builder - {str: string} to append to.
- * @param {boolean} isMarkdown - Unused (legacy).
  * @param {string} storyId - Story ID.
- * @param {Array} allTables - Table index.
+ * @param {Object} tablesByStoryId - Bucketed table lookup.
  * @param {Object} emittedTableIds - Tracked IDs.
+ * @param {boolean} tableCaptions - Include table meta in output.
  * @returns {boolean} True if emitted.
  */
-function emitAllTablesForStory(builder, isMarkdown, storyId, allTables, emittedTableIds) {
+function emitAllTablesForStory(builder, storyId, tablesByStoryId, emittedTableIds, tableCaptions) {
 	var wrote = false;
-	for (var i = 0; i < allTables.length; i++) {
-		var rec = allTables[i];
-		if (rec.storyId !== storyId) continue;
+	var list = tablesByStoryId[storyId] || [];
+	for (var i = 0; i < list.length; i++) {
+		var rec = list[i];
 		if (emittedTableIds[rec.tableId]) continue;
 		var pack = tableToTSV_Robust(rec.table);
-		var metaPart = pack.meta && pack.meta.length > 0 ? (pack.meta.join("\n") + "\n") : "";
+		var metaPart = (tableCaptions && pack.meta && pack.meta.length > 0) ? (pack.meta.join("\n") + "\n") : "";
 		var payload = metaPart + pack.lines.join("\n") + "\n";
 		var block = "[TABLE-TSV-BEGIN]\n" + payload + "[TABLE-TSV-END]\n\n";
 		if (builder.str.length > 0 && builder.str.substr(-2) !== "\n\n") builder.str += "\n";
@@ -873,13 +870,83 @@ function initializeScript() {
 }
 
 /**
+ * Renders the "leftover tables" block (tables not anchored to any exported story).
+ * Appends to target ({str:""}); marks emitted ids in __EMITTED_TABLE_IDS__.
+ * @param {Object} target - {str: string} builder to append to.
+ * @param {boolean} isMarkdown - Use Markdown formatting.
+ * @param {boolean} prettyMarkdown - Use pretty Markdown tables.
+ * @param {boolean} tableCaptions - Include table captions/meta.
+ * @param {number} headingHash - Heading level (number of # chars) for the section heading.
+ * @returns {boolean} True if any standalone tables were appended.
+ */
+function appendStandaloneTablesBlock(target, isMarkdown, prettyMarkdown, tableCaptions, headingHash) {
+	var allTables = __ALL_TABLES_INDEX__ || [];
+	var emittedTableIds = __EMITTED_TABLE_IDS__ || {};
+	var remaining = [];
+	for (var i = 0; i < allTables.length; i++) { var rec = allTables[i]; if (!emittedTableIds[rec.tableId]) remaining.push(rec); }
+	if (remaining.length === 0) return false;
+
+	if (isMarkdown) target.str += repeat("#", headingHash) + " Standalone Tables\n\n";
+	else target.str += "Standalone Tables\n-----------------\n\n";
+
+	var currentPage = null;
+	for (var t = 0; t < remaining.length; t++) {
+		var rec2 = remaining[t];
+		if (rec2.pageName !== currentPage) {
+			currentPage = rec2.pageName;
+			if (isMarkdown) target.str += "\n" + repeat("#", headingHash + 1) + " Page " + currentPage + "\n\n";
+			else target.str += "\nPage " + currentPage + "\n\n";
+		}
+		var pack = tableToTSV_Robust(rec2.table);
+		if (isMarkdown) {
+			target.str += renderTableBlockMarkdown(pack, prettyMarkdown, tableCaptions);
+		} else {
+			var metaPart = (tableCaptions && pack.meta && pack.meta.length > 0) ? (pack.meta.join("\n") + "\n") : "";
+			target.str += "[TABLE-TSV-BEGIN]\n" + metaPart + pack.lines.join("\n") + "\n[TABLE-TSV-END]\n\n";
+		}
+		emittedTableIds[rec2.tableId] = true;
+	}
+	return true;
+}
+
+/**
+ * Run convert+export inside a single undo step, then revert it. Atomic and exception-safe.
+ * @param {Object} story - InDesign story.
+ * @param {number} exportFormatConst - FORMAT_RTF or FORMAT_TAGGED_TEXT constant.
+ * @param {Object} outFile - File object to export to.
+ * @param {boolean} preserveNumbering - Convert numbering to text before export.
+ */
+function exportRtfOrTaggedAtomic(story, exportFormatConst, outFile, preserveNumbering) {
+	var idFmt = (exportFormatConst === FORMAT_RTF) ? ExportFormat.RTF : ExportFormat.TAGGED_TEXT;
+	if (!preserveNumbering) {
+		story.exportFile(idFmt, outFile);
+		return;
+	}
+	var didMutate = false;
+	try {
+		app.doScript(function() {
+			var paras = story.paragraphs;
+			for (var p = 0; p < paras.length; p++) {
+				var para = paras[p];
+				if (para.bulletsAndNumberingResultText.length > 0) {
+					para.convertNumberingToText();
+					didMutate = true;
+				}
+			}
+			story.exportFile(idFmt, outFile);
+		}, ScriptLanguage.JAVASCRIPT, undefined, UndoModes.ENTIRE_SCRIPT, "Export Story (with numbering converted)");
+	} finally {
+		if (didMutate) { try { app.activeDocument.undo(); } catch(eU) {} }
+	}
+}
+
+/**
  * Shows the export configuration dialog, loads/saves preferences via labels.
- * Handles format selection, options, path.
- * Calls exportStories on OK.
+ * Handles format selection, options, path. Calls exportStories on OK.
  */
 function showExportDialog() {
 	var lastFormat = parseInt(app.extractLabel("exportStories.format"), 10);
-	if (isNaN(lastFormat) || lastFormat < 0 || lastFormat > 3) lastFormat = 2;
+	if (isNaN(lastFormat) || lastFormat < FORMAT_RTF || lastFormat > FORMAT_TAGGED_TEXT) lastFormat = FORMAT_MARKDOWN;
 
 	var lastMinWords = app.extractLabel("exportStories.minWords");
 	if (lastMinWords === "") lastMinWords = "30";
@@ -891,6 +958,8 @@ function showExportDialog() {
 	if (lastSingleFile === "") lastSingleFile = "0";
 	var lastIncludeTables = app.extractLabel("exportStories.includeTables");
 	if (lastIncludeTables === "") lastIncludeTables = "1";
+	var lastTableCaptions = app.extractLabel("exportStories.tableCaptions");
+	if (lastTableCaptions === "") lastTableCaptions = "1";
 
 	var lastDoc = app.extractLabel("exportStories.lastDoc");
 	var lastPath = app.extractLabel("exportStories.lastPath");
@@ -900,10 +969,9 @@ function showExportDialog() {
 	}
 
 	var dialog = app.dialogs.add({ name: "Export All Stories" });
-	var formatButtons, preserveCheckbox, singleFileCheckbox, includeTablesCheckbox, minWordCountField, minFrameSizeField, pathEditbox;
+	var formatButtons, preserveCheckbox, singleFileCheckbox, includeTablesCheckbox, tableCaptionsCheckbox, minWordCountField, minFrameSizeField, pathEditbox;
 	with (dialog) {
-		var col = dialogColumns.add();
-		with (col) {
+		with (dialogColumns.add()) {
 			with (dialogRows.add()) {
 				with (dialogColumns.add()) {
 					with (borderPanels.add()) {
@@ -947,6 +1015,11 @@ function showExportDialog() {
 					}
 					with (inner.dialogRows.add()) {
 						with (dialogColumns.add()) {
+							tableCaptionsCheckbox = checkboxControls.add({ staticLabel: "Table captions (id, page, notes)", checkedState: lastTableCaptions === "1" });
+						}
+					}
+					with (inner.dialogRows.add()) {
+						with (dialogColumns.add()) {
 							singleFileCheckbox = checkboxControls.add({ staticLabel: "Export as single file (Markdown/Plain Text only)", checkedState: lastSingleFile === "1" });
 						}
 					}
@@ -964,10 +1037,17 @@ function showExportDialog() {
 		var userPreserveChoice = preserveCheckbox.checkedState;
 		var userSingleFileChoice = singleFileCheckbox.checkedState;
 
-		var isMarkdownOrPlainText = (exportFormat == 1 || exportFormat == 2);
-		var isMarkdown = (exportFormat == 2);
+		var isMarkdownOrPlainText = (exportFormat === FORMAT_PLAIN_TEXT || exportFormat === FORMAT_MARKDOWN);
+		var isMarkdown = (exportFormat === FORMAT_MARKDOWN);
 
 		var includeTables = includeTablesCheckbox.checkedState;
+		var tableCaptions = tableCaptionsCheckbox.checkedState;
+
+		// Single-file is meaningless for RTF/Tagged Text. Warn the user up front
+		// rather than silently exporting per-story (or hitting the old dead alert).
+		if (userSingleFileChoice && !isMarkdownOrPlainText) {
+			alert("Single file export only works for Markdown or Plain Text. Exporting per-story instead.");
+		}
 
 		var preserveNumbering = userPreserveChoice && isMarkdownOrPlainText;
 		var singleFile = userSingleFileChoice && isMarkdownOrPlainText;
@@ -982,6 +1062,7 @@ function showExportDialog() {
 		app.insertLabel("exportStories.preserveNumbering", userPreserveChoice ? "1" : "0");
 		app.insertLabel("exportStories.singleFile", userSingleFileChoice ? "1" : "0");
 		app.insertLabel("exportStories.includeTables", includeTables ? "1" : "0");
+		app.insertLabel("exportStories.tableCaptions", tableCaptions ? "1" : "0");
 		app.insertLabel("exportStories.minWords", minWordCountField.editContents);
 		app.insertLabel("exportStories.minFrameSize", minFrameSizeField.editContents);
 		app.insertLabel("exportStories.lastDoc", docName);
@@ -997,7 +1078,7 @@ function showExportDialog() {
 		}
 
 		if (app.activeDocument.stories.length != 0) {
-			exportStories(exportFormat, outFolder, minWordCount, minFrameSize, preserveNumbering, singleFile, includeTables, prettyMarkdown);
+			exportStories(exportFormat, outFolder, minWordCount, minFrameSize, preserveNumbering, singleFile, includeTables, prettyMarkdown, tableCaptions);
 		}
 	} else {
 		dialog.destroy();
@@ -1006,10 +1087,8 @@ function showExportDialog() {
 
 /**
  * Main export function: filters stories, collects tables, exports per format/options.
- * Handles single-file mode, standalone tables, undo for numbering conversion.
- * Formats: 0=RTF, 1=Plain, 2=MD, 3=Tagged.
- * Always includes table meta for TSV (Plain Text).
- * @param {number} exportFormat - Export format index.
+ * Handles single-file mode, standalone tables, atomic undo for RTF/Tagged numbering conversion.
+ * @param {number} exportFormat - Export format constant (FORMAT_*).
  * @param {Object} targetFolder - Output folder.
  * @param {number} minWordCount - Min words filter.
  * @param {number} minFrameSize - Min frame size filter.
@@ -1017,30 +1096,28 @@ function showExportDialog() {
  * @param {boolean} singleFile - Single file mode.
  * @param {boolean} includeTables - Export tables.
  * @param {boolean} prettyMarkdown - Pretty MD tables.
+ * @param {boolean} tableCaptions - Include table captions/meta.
  */
-function exportStories(exportFormat, targetFolder, minWordCount, minFrameSize, preserveNumbering, singleFile, includeTables, prettyMarkdown) {
-	var exportedCount = 0, skippedCount = 0, tocSkippedCount = 0;
-	var isMarkdown = (exportFormat == 2), isPlainText = (exportFormat == 1);
-	var singleFileContent = "";
+function exportStories(exportFormat, targetFolder, minWordCount, minFrameSize, preserveNumbering, singleFile, includeTables, prettyMarkdown, tableCaptions) {
+	var exportedCount = 0, skippedCount = 0, failedCount = 0;
+	var isMarkdown  = (exportFormat === FORMAT_MARKDOWN);
+	var isPlainText = (exportFormat === FORMAT_PLAIN_TEXT);
 	var storiesToProcess = [];
-	var exportedStoryIds = {};
 
-	// Collect tables if enabled
-	if (includeTables && typeof collectAllTables === "function") {
-		__ALL_TABLES_INDEX__ = collectAllTables(app.activeDocument);
-		__EMITTED_TABLE_IDS__ = {};
+	if (includeTables) {
+		__ALL_TABLES_INDEX__   = collectAllTables(app.activeDocument);
+		__TABLES_BY_STORY_ID__ = bucketTablesByStoryId(__ALL_TABLES_INDEX__);
+		__EMITTED_TABLE_IDS__  = {};
 	} else {
-		__ALL_TABLES_INDEX__ = [];
-		__EMITTED_TABLE_IDS__ = {};
+		__ALL_TABLES_INDEX__   = [];
+		__TABLES_BY_STORY_ID__ = {};
+		__EMITTED_TABLE_IDS__  = {};
 	}
-	var allTables = __ALL_TABLES_INDEX__;
-	var emittedTableIds = __EMITTED_TABLE_IDS__;
 
 	// Filter stories: skip TOC, pasteboard/small frames, short stories (unless tables)
 	for (var i = 0; i < app.activeDocument.stories.length; i++) {
 		var story = app.activeDocument.stories.item(i);
 		if (story.storyType == StoryTypes.TOC_STORY) {
-			tocSkippedCount++;
 			continue;
 		}
 
@@ -1070,188 +1147,75 @@ function exportStories(exportFormat, targetFolder, minWordCount, minFrameSize, p
 		}
 
 		storiesToProcess.push(story);
-		exportedStoryIds["" + story.id] = true;
 	}
 
-	// Single-file export (MD/Plain only)
 	if (singleFile && (isMarkdown || isPlainText)) {
+		var bigBuilder = { str: "" };
 		for (var s = 0; s < storiesToProcess.length; s++) {
-			var story = storiesToProcess[s];
-			if (s > 0) singleFileContent += "\n\n--------\n\n";
-			if (isMarkdown) {
-				singleFileContent += getStoryContentAsMarkdown(story, preserveNumbering, prettyMarkdown);
-			} else {
-				singleFileContent += getStoryContentAsPlainText(story, preserveNumbering);
-			}
-			exportedCount++;
+			var st = storiesToProcess[s];
+			try {
+				if (s > 0) bigBuilder.str += "\n\n--------\n\n";
+				if (isMarkdown) bigBuilder.str += buildStoryAsMarkdown(st, preserveNumbering, prettyMarkdown, tableCaptions);
+				else bigBuilder.str += buildStoryAsPlainText(st, preserveNumbering, tableCaptions);
+				exportedCount++;
+			} catch(eS) { failedCount++; }
 		}
 
-		// Append standalone tables
-		if (includeTables && allTables.length > 0) {
-			var remaining = [];
-			for (var r = 0; r < allTables.length; r++) {
-				var rec = allTables[r];
-				if (!emittedTableIds[rec.tableId]) remaining.push(rec);
-			}
-			if (remaining.length > 0) {
-				if (isMarkdown) singleFileContent += "\n\n## Standalone Tables\n\n";
-				else singleFileContent += "\n\nStandalone Tables\n-----------------\n\n";
-				var currentPage = null;
-				for (var t = 0; t < remaining.length; t++) {
-					var rec2 = remaining[t];
-					if (rec2.pageName !== currentPage) {
-						currentPage = rec2.pageName;
-						if (isMarkdown) singleFileContent += "\n### Page " + currentPage + "\n\n";
-						else singleFileContent += "\nPage " + currentPage + "\n\n";
-					}
-					var pack2 = tableToTSV_Robust(rec2.table);
-					if (isMarkdown) {
-						singleFileContent += renderTableBlockMarkdown(pack2, prettyMarkdown);
-					} else {
-						var metaPart = pack2.meta && pack2.meta.length > 0 ? (pack2.meta.join("\n") + "\n") : "";
-						var payload2 = metaPart + pack2.lines.join("\n") + "\n";
-						singleFileContent += "[TABLE-TSV-BEGIN]\n" + payload2 + "[TABLE-TSV-END]\n\n";
-					}
-					emittedTableIds[rec2.tableId] = true;
-				}
-			}
-		}
+		if (includeTables) appendStandaloneTablesBlock(bigBuilder, isMarkdown, prettyMarkdown, tableCaptions, 2);
 
-		// Write single file
 		var docName = app.activeDocument.name.replace(/\.indd$/i, "");
 		var ext = isMarkdown ? ".md" : ".txt";
 		var out = new File(targetFolder + "/" + docName + "_all_stories" + ext);
-		var c = 1;
-		while (out.exists) {
-			out = new File(targetFolder + "/" + docName + "_all_stories_" + c + ext);
-			c++;
-		}
-		out.open("w");
-		out.encoding = "UTF-8";
-		out.write(singleFileContent);
-		out.close();
-
-	} else if (singleFile) {
-		alert("Single file export is only supported for Markdown and Plain Text formats.");
-		return;
+		var c = 1; while (out.exists) { out = new File(targetFolder + "/" + docName + "_all_stories_" + c + ext); c++; }
+		writeStringToFile(out, bigBuilder.str);
 
 	} else {
-		// Individual file exports
 		for (var idx = 0; idx < storiesToProcess.length; idx++) {
-			var story = storiesToProcess[idx];
+			var story2 = storiesToProcess[idx];
+			try {
+				var fileName = "";
+				if (story2.words.length > 0) { var wc = Math.min(5, story2.words.length); for (var w = 0; w < wc; w++) fileName += story2.words[w].contents + " "; }
+				fileName = fileName.replace(/^\s+|\s+$/g, "");
+				var illegal = ["/", "\\", ":", "*", "?", "\"", "<", ">", "|"]; for (var k = 0; k < illegal.length; k++) fileName = fileName.split(illegal[k]).join("");
+				fileName = fileName.substring(0, 60);
+				if (fileName === "") fileName = "Story_" + story2.id;
 
-			var numConverts = 0;
-			// Convert numbering to text for RTF/Tagged (if preserve), then undo later
-			if (preserveNumbering && (exportFormat === 0 || exportFormat === 3)) {
-				for (var p = 0; p < story.paragraphs.length; p++) {
-					var para = story.paragraphs[p];
-					if (para.bulletsAndNumberingResultText.length > 0) {
-						para.convertNumberingToText();
-						numConverts++;
-					}
-				}
-			}
+				var extension;
+				if (isMarkdown) extension = ".md";
+				else if (isPlainText) extension = ".txt";
+				else if (exportFormat === FORMAT_RTF) extension = ".rtf";
+				else extension = ".txt"; // FORMAT_TAGGED_TEXT
 
-			// Generate filename from first 5 words, sanitize
-			var fileName = "";
-			if (story.words.length > 0) {
-				var wc = Math.min(5, story.words.length);
-				for (var w = 0; w < wc; w++) fileName += story.words[w].contents + " ";
-			}
-			fileName = fileName.replace(/^\s+|\s+$/g, "");
-			var illegal = ["/", "\\", ":", "*", "?", "\"", "<", ">", "|"];
-			for (var k = 0; k < illegal.length; k++) fileName = fileName.split(illegal[k]).join("");
-			fileName = fileName.substring(0, 60);
-			if (fileName === "") fileName = "Story_" + story.id;
+				var outFile = new File(targetFolder + "/" + fileName + extension);
+				var counter = 1; while (outFile.exists) { outFile = new File(targetFolder + "/" + fileName + "_" + counter + extension); counter++; }
 
-			var format, extension;
-			if (isMarkdown) extension = ".md";
-			else if (isPlainText) extension = ".txt";
-			else {
-				switch (exportFormat) {
-					case 0:
-						format = ExportFormat.RTF;
-						extension = ".rtf";
-						break;
-					case 3:
-						format = ExportFormat.TAGGED_TEXT;
-						extension = ".txt";
-						break;
-				}
-			}
+				if (isMarkdown) exportStoryAsMarkdown(story2, outFile, preserveNumbering, prettyMarkdown, tableCaptions);
+				else if (isPlainText) exportStoryAsPlainText(story2, outFile, preserveNumbering, tableCaptions);
+				else exportRtfOrTaggedAtomic(story2, exportFormat, outFile, preserveNumbering);
 
-			var outFile = new File(targetFolder + "/" + fileName + extension);
-			var counter = 1;
-			while (outFile.exists) {
-				outFile = new File(targetFolder + "/" + fileName + "_" + counter + extension);
-				counter++;
-			}
-
-			if (isMarkdown) {
-				exportStoryAsMarkdown(story, outFile, preserveNumbering, prettyMarkdown);
-			} else if (isPlainText) {
-				exportStoryAsPlainText(story, outFile, preserveNumbering);
-			} else {
-				story.exportFile(format, outFile);
-			}
-
-			// Undo numbering conversions
-			for (var u = 0; u < numConverts; u++) app.activeDocument.undo();
-			exportedCount++;
+				exportedCount++;
+			} catch(eStory) { failedCount++; }
 		}
 
-		// Export standalone tables as separate file (MD/Plain only)
 		if (includeTables && (isMarkdown || isPlainText) && __ALL_TABLES_INDEX__.length > 0) {
-			var remaining2 = [];
-			for (var r2 = 0; r2 < __ALL_TABLES_INDEX__.length; r2++) {
-				var rec3 = __ALL_TABLES_INDEX__[r2];
-				if (!__EMITTED_TABLE_IDS__[rec3.tableId]) remaining2.push(rec3);
-			}
-			if (remaining2.length > 0) {
+			var stBuilder = { str: "" };
+			var any = appendStandaloneTablesBlock(stBuilder, isMarkdown, prettyMarkdown, tableCaptions, 1);
+			if (any) {
 				var docName2 = app.activeDocument.name.replace(/\.indd$/i, "");
 				var ext2 = isMarkdown ? ".md" : ".txt";
 				var stFile = new File(targetFolder + "/" + docName2 + "_standalone_tables" + ext2);
-				var cc = 1;
-				while (stFile.exists) {
-					stFile = new File(targetFolder + "/" + docName2 + "_standalone_tables_" + cc + ext2);
-					cc++;
-				}
-				var buf = "";
-				if (isMarkdown) buf += "# Standalone Tables\n\n";
-				else buf += "Standalone Tables\n-----------------\n\n";
-				var currentPage2 = null;
-				for (var t2 = 0; t2 < remaining2.length; t2++) {
-					var rec4 = remaining2[t2];
-					if (rec4.pageName !== currentPage2) {
-						currentPage2 = rec4.pageName;
-						if (isMarkdown) buf += "\n## Page " + currentPage2 + "\n\n";
-						else buf += "\nPage " + currentPage2 + "\n\n";
-					}
-					var pack4 = tableToTSV_Robust(rec4.table);
-					if (isMarkdown) {
-						buf += renderTableBlockMarkdown(pack4, prettyMarkdown);
-					} else {
-						var metaPart2 = pack4.meta && pack4.meta.length > 0 ? (pack4.meta.join("\n") + "\n") : "";
-						var payload4 = metaPart2 + pack4.lines.join("\n") + "\n";
-						buf += "[TABLE-TSV-BEGIN]\n" + payload4 + "[TABLE-TSV-END]\n\n";
-					}
-					__EMITTED_TABLE_IDS__[rec4.tableId] = true;
-				}
-				stFile.open("w");
-				stFile.encoding = "UTF-8";
-				stFile.write(buf);
-				stFile.close();
+				var cc = 1; while (stFile.exists) { stFile = new File(targetFolder + "/" + docName2 + "_standalone_tables_" + cc + ext2); cc++; }
+				writeStringToFile(stFile, stBuilder.str);
 			}
 		}
 	}
 
-	// Summary alert
-	alert(
-		"Export complete!\n\n" +
+	var msg = "Export complete!\n\n" +
 		"Exported: " + exportedCount + " stories\n" +
-		"Skipped: " + skippedCount + " stories\n\n" +
-		"Files saved to:\n" + targetFolder.fsName + "\n"
-	);
+		"Skipped: "  + skippedCount  + " stories\n";
+	if (failedCount > 0) msg += "Failed: " + failedCount + " stories\n";
+	msg += "\nFiles saved to:\n" + targetFolder.fsName + "\n";
+	alert(msg);
 }
 
 // Entry point
