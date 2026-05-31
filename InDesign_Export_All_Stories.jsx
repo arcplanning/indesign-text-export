@@ -1,5 +1,4 @@
 /*
-ExportAllStories.jsx
 
 An InDesign JavaScript to export all stories.
 Copyright © 2009 Adobe Systems Incorporated.
@@ -7,22 +6,24 @@ https://console.adobe.io/downloads/id
 Revision: Architectural Research Consultants, Incorporated under Adobe SDK License + MIT.
 
 Date: 2025-09-30
-Revised: 2025-11-11
+Revised: 2026-05-30
 
 Update of Adobe's default script called "ExportAllStories.jsx".
 Exports all stories in an InDesign document in a specified text format.
 Ignores small text frames, items on pasteboard, and very short text snippets.
 
-This script provides options to export stories as RTF, Plain Text, Markdown, or InDesign Tagged Text.
-It includes advanced features like preserving list numbering, handling tables as TSV or Markdown tables,
-filtering stories by word count and frame size, and options for single-file export.
+Formats: RTF, Plain Text, Markdown, or InDesign Tagged Text. Markdown / Plain Text
+are consolidated into a single output file in reading order; RTF / Tagged Text are
+written one file per story (the only thing InDesign's native exportFile supports).
+Tested on macOS; filenames are sanitised for both macOS and Windows.
 
 Key Features:
 - Dialog for user configuration (format, filters, options).
-- Automatic detection and export of tables within stories.
-- Support for cross-references resolution in content.
-- Classification of paragraphs for better Markdown rendering (headings, lists).
-- Standalone table export for tables not tied to exported stories.
+- Reading-order traversal (page order, then top-to-bottom / left-to-right).
+- Heading inference from style names, basedOn chain, and optionally text size.
+- Automatic detection and export of tables (TSV or Markdown table).
+- Cross-reference resolution in content (fast-path when none present).
+- Standalone-tables block for tables not tied to any exported story.
 */
 
 // -----------------------
@@ -39,6 +40,23 @@ var FORMAT_TAGGED_TEXT  = 3;
 var __ALL_TABLES_INDEX__    = null; // [{table, tableId, storyId, storyOffset, pageName, top, left}]
 var __TABLES_BY_STORY_ID__  = null; // { storyId: [rec, ...] } -- same recs as above, bucketed
 var __EMITTED_TABLE_IDS__   = null; // { tableId: true }
+var __HEADING_SIZE_LEVELS__ = null; // { roundedPointSize: headingLevel } when size-inference is enabled
+
+// Hoisted regexes -- ExtendScript does not reliably cache regex literals across calls.
+var __RE_RIGHT_INDENT_TAB__ = new RegExp("\\u0019", "g");
+var __RE_TAB__              = /\t/g;
+var __RE_PAGE_PLACEHOLDER__ = new RegExp("(\\b[Pp]age\\s+)[\\u0000-\\u0008\\u000B-\\u000C\\u000E-\\u001F\\uFFFC\\uFEFF\\uFFFE\\uFFFF]", "g");
+var __RE_INVISIBLES__       = new RegExp("[\\u0000-\\u0008\\u000B-\\u000C\\u000E-\\u001F\\uFFFC\\uFEFF\\uFFFE\\uFFFF]", "g");
+var __RE_MULTI_SPACE__      = / +/g;
+var __RE_CONTROL_CHARS__    = new RegExp("[\\u0000-\\u001F]", "g");
+var __RE_TRAILING_DOTSP__   = /[\s.]+$/;
+var __RE_TRIM__             = /^\s+|\s+$/g;
+
+// Windows reserved device names. Files with these basenames cannot be created on Windows
+// even if the extension differs -- prefix with "_" to dodge.
+var __WIN_RESERVED__ = { CON:1, PRN:1, AUX:1, NUL:1,
+	COM1:1, COM2:1, COM3:1, COM4:1, COM5:1, COM6:1, COM7:1, COM8:1, COM9:1,
+	LPT1:1, LPT2:1, LPT3:1, LPT4:1, LPT5:1, LPT6:1, LPT7:1, LPT8:1, LPT9:1 };
 
 // -----------------------
 // Utility Functions
@@ -109,17 +127,115 @@ function toArray(a) {
 }
 
 /**
+ * parseInt with a typed fallback. Replaces bare parseInt() calls so empty fields
+ * or garbage input don't propagate NaN into comparisons (where `x < NaN` is always
+ * false and silently disables filters).
+ * @param {string} str - Input string.
+ * @param {number} fallback - Returned if parsing fails.
+ * @returns {number}
+ */
+function parseIntOr(str, fallback) {
+	var n = parseInt(str, 10);
+	if (isNaN(n)) return fallback;
+	return n;
+}
+
+/**
+ * Sanitises a story-derived filename so it works on both macOS and Windows.
+ * Strips illegal characters, control bytes, trailing dots/spaces (Windows collapses
+ * those silently and can collide), and dodges reserved Windows device names like CON.
+ * @param {string} name - Raw filename (no extension).
+ * @param {string} fallback - Returned if sanitisation empties the name.
+ * @returns {string}
+ */
+function sanitizeFilename(name, fallback) {
+	name = safeToString(name).replace(__RE_TRIM__, "");
+	var illegal = ["/", "\\", ":", "*", "?", "\"", "<", ">", "|"];
+	for (var k = 0; k < illegal.length; k++) name = name.split(illegal[k]).join("");
+	name = name.replace(__RE_CONTROL_CHARS__, "");
+	if (name.length > 60) name = name.substring(0, 60);
+	name = name.replace(__RE_TRAILING_DOTSP__, "");
+	if (name === "") return fallback;
+	var base = name.replace(/\.[^.]*$/, "").toUpperCase();
+	if (__WIN_RESERVED__[base]) name = "_" + name;
+	return name;
+}
+
+/**
+ * Pre-fetches per-paragraph attributes in one DOM round-trip each. ExtendScript's
+ * per-property access is the single biggest perf cost on large docs; reading via
+ * `paragraphs.everyItem().<prop>` returns the whole array in one call.
+ * Falls back to per-item access for any attribute the batch path can't resolve.
+ * @param {Object} story - InDesign story.
+ * @returns {Object} Snapshot with parallel arrays and a hasCrossRefs flag.
+ */
+function getStoryParaSnapshot(story) {
+	var paras = story.paragraphs;
+	var objs;
+	try { objs = paras.everyItem().getElements(); } catch (e) { objs = []; }
+	var n = objs.length;
+	var snap = {
+		story: story,
+		paras: paras,
+		objs: objs,
+		length: n,
+		contents:         batchProperty(paras, "contents", n, ""),
+		leftIndents:      batchProperty(paras, "leftIndent", n, 0),
+		firstLineIndents: batchProperty(paras, "firstLineIndent", n, 0),
+		bullets:          batchProperty(paras, "bulletsAndNumberingResultText", n, ""),
+		styles:           batchProperty(paras, "appliedParagraphStyle", n, null),
+		pointSizes:       batchProperty(paras, "pointSize", n, null),
+		hasCrossRefs: false
+	};
+	try { snap.hasCrossRefs = story.crossReferenceSources.length > 0; } catch (eCR) {}
+	return snap;
+}
+
+/**
+ * Reads `coll.everyItem().<prop>` and coerces it to an array of length n. If the
+ * batched read fails or returns the wrong shape, falls back to per-item access.
+ * Per-item entries that fail (e.g. mixed pointSize across runs in one paragraph)
+ * are filled with the supplied fallback.
+ * @param {Object} coll - InDesign collection.
+ * @param {string} prop - Property name.
+ * @param {number} n - Expected length.
+ * @param {*} fallback - Value used when an individual entry is unreadable.
+ * @returns {Array}
+ */
+function batchProperty(coll, prop, n, fallback) {
+	var batched = null;
+	try { batched = coll.everyItem()[prop]; } catch (e) {}
+	if (batched && typeof batched.length === "number" && batched.length === n) {
+		var out = [];
+		for (var i = 0; i < n; i++) {
+			var v = batched[i];
+			if (typeof v === "undefined" || v === null) v = fallback;
+			out.push(v);
+		}
+		return out;
+	}
+	var arr = [];
+	for (var j = 0; j < n; j++) {
+		var item = coll[j];
+		var val = fallback;
+		try { val = item[prop]; if (typeof val === "undefined" || val === null) val = fallback; } catch (eI) {}
+		arr.push(val);
+	}
+	return arr;
+}
+
+/**
  * Cleans special characters from content: replaces tabs, control chars, multiple spaces.
  * Specifically handles right indent tabs, page placeholders, and invisible chars.
  * @param {string} content - The input content.
  * @returns {string} Cleaned content.
  */
 function cleanSpecialCharacters(content) {
-	content = content.replace(/\u0019/g, " "); // right indent tab
-	content = content.replace(/\t/g, " ");     // tabs -> spaces (paragraph text only)
-	content = content.replace(/(\b[Pp]age\s+)[\u0000-\u0008\u000B-\u000C\u000E-\u001F\uFFFC\uFEFF\uFFFE\uFFFF]/g, "$1[#]");
-	content = content.replace(/[\u0000-\u0008\u000B-\u000C\u000E-\u001F\uFFFC\uFEFF\uFFFE\uFFFF]/g, "");
-	content = content.replace(/ +/g, " ");
+	content = content.replace(__RE_RIGHT_INDENT_TAB__, " ");
+	content = content.replace(__RE_TAB__, " ");
+	content = content.replace(__RE_PAGE_PLACEHOLDER__, "$1[#]");
+	content = content.replace(__RE_INVISIBLES__, "");
+	content = content.replace(__RE_MULTI_SPACE__, " ");
 	return content;
 }
 
@@ -171,21 +287,13 @@ function isBulletMarker(marker) {
 	return false;
 }
 
-// One pass over the story; -1 marks "not a list item" so findMinListIndent can ignore it.
-function precomputeListIndents(story) {
-	var paras = story.paragraphs;
-	var n = paras.length;
+// One pass over the snapshot; -1 marks "not a list item" so findMinListIndent can ignore it.
+function precomputeListIndents(snap) {
 	var indents = [];
-	for (var i = 0; i < n; i++) {
-		var para = paras[i];
-		var prev = i > 0 ? paras[i - 1] : null;
-		var next = i < n - 1 ? paras[i + 1] : null;
-		var isList = false;
-		try { isList = isStructuralListItem(para, prev, next) || para.bulletsAndNumberingResultText.length > 0; } catch(e) {}
-		if (isList) {
-			var li = 0; try { li = para.leftIndent; } catch(e2) {}
-			indents.push(li);
-		} else indents.push(-1);
+	for (var i = 0; i < snap.length; i++) {
+		var hasMarker = (snap.bullets[i] || "").length > 0;
+		var isList = hasMarker || isStructuralListItem(snap, i);
+		indents.push(isList ? (snap.leftIndents[i] || 0) : -1);
 	}
 	return indents;
 }
@@ -210,56 +318,182 @@ function findMinListIndent(listIndents, startIndex) {
 
 /**
  * Calculates nesting level for lists based on relative indent (assuming 20pt per level).
- * @param {Object} para - InDesign paragraph.
+ * @param {number} leftIndent - Paragraph left indent in points.
  * @param {number} minIndent - Baseline indent.
  * @returns {number} Nesting level.
  */
-function getListNestingLevel(para, minIndent) {
-	var rel = para.leftIndent - minIndent;
+function getListNestingLevel(leftIndent, minIndent) {
+	var rel = leftIndent - minIndent;
 	if (rel <= 0) return 0;
 	return Math.floor(rel / 20);
 }
 
 /**
  * Detects if a paragraph is part of a structural list (hanging indent, marker, context).
- * Used for inferring lists without explicit styling.
- * @param {Object} para - Current paragraph.
- * @param {Object|null} prevPara - Previous paragraph.
- * @param {Object|null} nextPara - Next paragraph.
- * @returns {boolean} True if structural list item.
+ * Operates entirely on snapshot arrays -- no DOM access -- so it's cheap to call
+ * repeatedly. Uses raw paragraph contents length for the short-line heuristic;
+ * resolving cross-references here just to measure length would be wasteful.
+ * @param {Object} snap - Story snapshot from getStoryParaSnapshot.
+ * @param {number} i - Paragraph index.
+ * @returns {boolean}
  */
-function isStructuralListItem(para, prevPara, nextPara) {
-	var hasHangingIndent = para.leftIndent > 0 && para.firstLineIndent < 0;
-	var hasLeftIndent = para.leftIndent > 0;
-	var content = trim(cleanSpecialCharacters(getContentWithResolvedCrossRefs(para)));
-	var shortLine = content.length > 0 && content.length < 200;
-	var hasListMarker = para.bulletsAndNumberingResultText.length > 0;
-	var hasListContext = false;
-	if (prevPara && prevPara.leftIndent > 0 && Math.abs(prevPara.leftIndent - para.leftIndent) < 5) hasListContext = true;
-	if (nextPara && nextPara.leftIndent > 0 && Math.abs(nextPara.leftIndent - para.leftIndent) < 5) hasListContext = true;
-
-	if (hasHangingIndent) return true;
-	if (hasListMarker) return true;
-	if (hasLeftIndent && shortLine && hasListContext) return true;
+function isStructuralListItem(snap, i) {
+	var leftIndent = snap.leftIndents[i] || 0;
+	var firstLineIndent = snap.firstLineIndents[i] || 0;
+	var hasHangingIndent = leftIndent > 0 && firstLineIndent < 0;
+	var hasListMarker = (snap.bullets[i] || "").length > 0;
+	if (hasHangingIndent || hasListMarker) return true;
+	if (leftIndent <= 0) return false;
+	var rawLen = (snap.contents[i] || "").length;
+	if (rawLen === 0 || rawLen >= 200) return false;
+	if (i > 0) {
+		var prevLi = snap.leftIndents[i - 1] || 0;
+		if (prevLi > 0 && Math.abs(prevLi - leftIndent) < 5) return true;
+	}
+	if (i < snap.length - 1) {
+		var nextLi = snap.leftIndents[i + 1] || 0;
+		if (nextLi > 0 && Math.abs(nextLi - leftIndent) < 5) return true;
+	}
 	return false;
 }
 
 /**
- * Classifies paragraph style: heading (H1-H6), bullet, numbered, or body.
- * Based on style name patterns.
- * @param {Object} para - InDesign paragraph.
- * @returns {Object} {type: "heading|bullet|numbered|body", level?: number}
+ * Tries to classify a style by its name alone. Returns null on no match.
+ * Recognises digit-suffixed heading names (H1, Heading 2, Header3, Title 4...),
+ * name-only cues (Title/Chapter → H1, Subtitle/Subhead/Section → H2),
+ * and bullet/numbered hints.
+ * @param {string} rawName - Style name.
+ * @returns {Object|null}
  */
-function classifyParagraphStyle(para) {
-	var n = trim(para.appliedParagraphStyle.name.toLowerCase());
+function classifyStyleName(rawName) {
+	var n = trim((rawName || "").toLowerCase());
+	if (!n) return null;
 	var m = n.match(/(h|head|heading|header|title|banner)[^\d]*(\d+)/);
 	if (m) {
 		var level = parseInt(m[2], 10);
 		if (level >= 1 && level <= 6) return { type: "heading", level: level };
 	}
+	if (/\bchapter\b/.test(n)) return { type: "heading", level: 1 };
+	if (/\bsubtitle\b/.test(n) || /\bsubhead(ing)?\b/.test(n) || /\bsection\b/.test(n)) return { type: "heading", level: 2 };
+	if (/\btitle\b/.test(n)) return { type: "heading", level: 1 };
 	if (n.indexOf("bullet") > -1 || /^b\d+/.test(n)) return { type: "bullet" };
 	if (n.indexOf("number") > -1 || n.indexOf("num") > -1 || /^n\d+/.test(n)) return { type: "numbered" };
+	return null;
+}
+
+/**
+ * Walks the basedOn chain of a paragraph style and returns the first classification hit.
+ * Lets house styles inherit semantics from their parent ("Body Lead" based on "Heading 2 Custom").
+ * Cycle-safe via visited set.
+ * @param {Object} style - InDesign paragraph style.
+ * @returns {Object|null}
+ */
+function classifyStyleChain(style) {
+	var visited = {};
+	var s = style;
+	while (s) {
+		var sid;
+		try { sid = "" + s.id; } catch(eId) { break; }
+		if (visited[sid]) break;
+		visited[sid] = true;
+		var hit = classifyStyleName(s.name);
+		if (hit) return hit;
+		var parent = null;
+		try { parent = s.basedOn; } catch(eB) { break; }
+		if (!parent || parent === s) break;
+		try { if (parent.name === "[No Paragraph Style]") break; } catch(eN) { break; }
+		s = parent;
+	}
+	return null;
+}
+
+/**
+ * Coerces a raw pointSize value (from snapshot or DOM) to a number rounded to 1 decimal.
+ * Returns null when the value is mixed/missing. Caller is responsible for any style-level
+ * fallback (we no longer chase that automatically -- callers that need it pass it in).
+ * @param {*} raw - Raw pointSize value.
+ * @returns {number|null}
+ */
+function roundPointSize(raw) {
+	var sz = null;
+	if (typeof raw === "number") sz = raw;
+	else if (raw && typeof raw.length === "number" && raw.length > 0 && typeof raw[0] === "number") sz = raw[0];
+	if (typeof sz !== "number" || isNaN(sz) || sz <= 0) return null;
+	return Math.round(sz * 10) / 10;
+}
+
+/**
+ * Builds a {size: headingLevel} map by sampling paragraph sizes from the given snapshots.
+ * Body size = most common size; distinct larger sizes are ranked descending into H1..H6.
+ * Returns null if there isn't enough size variation to be useful.
+ * @param {Array} snapshots - Story snapshots to sample.
+ * @returns {Object|null}
+ */
+function buildHeadingSizeMap(snapshots) {
+	var counts = {};
+	for (var s = 0; s < snapshots.length; s++) {
+		var snap = snapshots[s];
+		for (var i = 0; i < snap.length; i++) {
+			if ((snap.contents[i] || "").length === 0) continue;
+			var sz = roundPointSize(snap.pointSizes[i]);
+			if (sz === null && snap.styles[i]) {
+				try { sz = roundPointSize(snap.styles[i].pointSize); } catch (eS) {}
+			}
+			if (sz === null) continue;
+			counts[sz] = (counts[sz] || 0) + 1;
+		}
+	}
+	var sizes = [];
+	for (var k in counts) if (counts.hasOwnProperty(k)) sizes.push({ size: parseFloat(k), count: counts[k] });
+	if (sizes.length < 2) return null;
+	sizes.sort(function(a, b) { return b.count - a.count; });
+	var bodySize = sizes[0].size;
+	var larger = [];
+	for (var j = 0; j < sizes.length; j++) if (sizes[j].size > bodySize) larger.push(sizes[j].size);
+	if (larger.length === 0) return null;
+	larger.sort(function(a, b) { return b - a; });
+	var map = {};
+	for (var L = 0; L < larger.length && L < 6; L++) map[larger[L]] = L + 1;
+	return map;
+}
+
+/**
+ * Classifies a paragraph from the snapshot: heading (H1-H6), bullet, numbered, or body.
+ * Tries the applied style's name chain (leaf + basedOn ancestors), then falls back to
+ * the point-size map if one was built.
+ * @param {Object} snap - Story snapshot.
+ * @param {number} i - Paragraph index.
+ * @returns {Object} {type: "heading|bullet|numbered|body", level?: number}
+ */
+function classifyParagraphStyle(snap, i) {
+	var style = snap.styles[i];
+	if (style) {
+		var hit = classifyStyleChain(style);
+		if (hit) return hit;
+	}
+	if (__HEADING_SIZE_LEVELS__) {
+		var sz = roundPointSize(snap.pointSizes[i]);
+		if (sz === null && style) {
+			try { sz = roundPointSize(style.pointSize); } catch (e) {}
+		}
+		if (sz !== null && __HEADING_SIZE_LEVELS__[sz]) {
+			return { type: "heading", level: __HEADING_SIZE_LEVELS__[sz] };
+		}
+	}
 	return { type: "body" };
+}
+
+/**
+ * Returns paragraph content for the build loops. Fast-paths to the snapshot's
+ * pre-fetched `contents` array when the story has no cross-references; falls
+ * back to the per-text DOM walk when it does.
+ * @param {Object} snap - Story snapshot.
+ * @param {number} i - Paragraph index.
+ * @returns {string}
+ */
+function getParaContent(snap, i) {
+	if (!snap.hasCrossRefs) return snap.contents[i] || "";
+	return getContentWithResolvedCrossRefs(snap.objs[i]);
 }
 
 // -----------------------
@@ -583,6 +817,54 @@ function getWordCount(story) {
 }
 
 // -----------------------
+// Story Ordering
+// -----------------------
+/**
+ * Returns the document's stories in reading order (page order, then top-to-bottom
+ * / left-to-right within a page). `doc.stories` itself returns creation order,
+ * which causes exports to come out jumbled when frames weren't added in reading order.
+ * Threaded stories appear at the position of their first frame. Any stories not
+ * reachable from a page (pasteboard, etc.) are appended at the end so nothing is lost.
+ * @param {Object} doc - InDesign document.
+ * @returns {Array} Stories in reading order.
+ */
+function collectStoriesInReadingOrder(doc) {
+	var seen = {};
+	var ordered = [];
+	var pages;
+	try { pages = doc.pages.everyItem().getElements(); } catch (e) { pages = []; }
+	for (var p = 0; p < pages.length; p++) {
+		var frames;
+		try { frames = pages[p].textFrames.everyItem().getElements(); } catch (eF) { frames = []; }
+		frames.sort(function(a, b) {
+			try {
+				var ay = a.geometricBounds[0], by = b.geometricBounds[0];
+				if (Math.abs(ay - by) > 2) return ay - by;
+				return a.geometricBounds[1] - b.geometricBounds[1];
+			} catch (eS) { return 0; }
+		});
+		for (var f = 0; f < frames.length; f++) {
+			try {
+				var story = frames[f].parentStory;
+				if (!story || !story.isValid) continue;
+				var id = "" + story.id;
+				if (seen[id]) continue;
+				seen[id] = true;
+				ordered.push(story);
+			} catch (eP) {}
+		}
+	}
+	try {
+		var all = doc.stories.everyItem().getElements();
+		for (var i = 0; i < all.length; i++) {
+			var sid = "" + all[i].id;
+			if (!seen[sid]) { seen[sid] = true; ordered.push(all[i]); }
+		}
+	} catch (eA) {}
+	return ordered;
+}
+
+// -----------------------
 // Table Collection and Indexing
 // -----------------------
 /**
@@ -687,15 +969,16 @@ function writeStringToFile(outputFile, s) {
 }
 
 /**
- * Builds Markdown content for a story: paragraphs with styles, lists, headings, tables.
- * Handles spacing, prefixes, nesting. Emits tables inline, falls back to end.
- * @param {Object} story - InDesign story.
+ * Builds Markdown content for a story snapshot: paragraphs with styles, lists, headings,
+ * then tables. Operates on pre-fetched arrays so the inner loop avoids the DOM entirely
+ * (except for the cross-reference fast path).
+ * @param {Object} snap - Story snapshot from getStoryParaSnapshot.
  * @param {boolean} preserveNumbering - Use actual markers.
  * @param {boolean} prettyMarkdown - Enable pretty tables.
  * @param {boolean} tableCaptions - Include table captions/meta.
- * @returns {string} Markdown content.
+ * @returns {string}
  */
-function buildStoryAsMarkdown(story, preserveNumbering, prettyMarkdown, tableCaptions) {
+function buildStoryAsMarkdown(snap, preserveNumbering, prettyMarkdown, tableCaptions) {
 	var builder = { str: "" };
 	var prevWasHeading = false;
 
@@ -703,21 +986,13 @@ function buildStoryAsMarkdown(story, preserveNumbering, prettyMarkdown, tableCap
 	var emittedTableIds = __EMITTED_TABLE_IDS__ || {};
 	var hasAnyTables    = !!__ALL_TABLES_INDEX__ && __ALL_TABLES_INDEX__.length > 0;
 
-	var wroteTables = hasAnyTables
-		? emitTablesForStory_MD(builder, "" + story.id, tablesByStoryId, emittedTableIds, prettyMarkdown, tableCaptions)
-		: false;
+	var listIndents = precomputeListIndents(snap);
 
-	var paras = story.paragraphs;
-	var listIndents = precomputeListIndents(story);
+	for (var i = 0; i < snap.length; i++) {
+		if ((snap.contents[i] || "").length === 0) continue;
 
-	for (var i = 0; i < paras.length; i++) {
-		var para = paras[i];
-		if (para.contents.length === 0) continue;
-
-		var prev = i > 0 ? paras[i - 1] : null;
-		var next = i < paras.length - 1 ? paras[i + 1] : null;
-		var style = classifyParagraphStyle(para);
-		var structural = isStructuralListItem(para, prev, next);
+		var style = classifyParagraphStyle(snap, i);
+		var structural = isStructuralListItem(snap, i);
 		var prefix = "";
 		var isListForSpacing = (style.type === "bullet" || style.type === "numbered" || structural) && style.type !== "heading";
 
@@ -727,10 +1002,11 @@ function buildStoryAsMarkdown(story, preserveNumbering, prettyMarkdown, tableCap
 			prevWasHeading = true;
 		} else if (structural || style.type === "bullet" || style.type === "numbered") {
 			var mi = findMinListIndent(listIndents, i);
-			var nesting = getListNestingLevel(para, mi);
+			var nesting = getListNestingLevel(snap.leftIndents[i] || 0, mi);
 			var ind = repeat("\t", nesting);
-			if (preserveNumbering && para.bulletsAndNumberingResultText.length > 0) {
-				var marker = trim(para.bulletsAndNumberingResultText);
+			var bullet = snap.bullets[i] || "";
+			if (preserveNumbering && bullet.length > 0) {
+				var marker = trim(bullet);
 				prefix = ind + (isBulletMarker(marker) ? "- " : (marker + " "));
 			} else if (style.type === "numbered") {
 				prefix = ind + "1. ";
@@ -742,84 +1018,53 @@ function buildStoryAsMarkdown(story, preserveNumbering, prettyMarkdown, tableCap
 			prevWasHeading = false;
 		}
 
-		var content = cleanSpecialCharacters(getContentWithResolvedCrossRefs(para));
+		var content = cleanSpecialCharacters(getParaContent(snap, i));
 		var line = prefix + content.replace(/\r$/, "");
-		if (line.replace(/^\s+|\s+$/g, "").length === 0) continue;
+		if (line.replace(__RE_TRIM__, "").length === 0) continue;
 
 		builder.str += isListForSpacing ? (line + "\n") : (line + "\n\n");
 	}
 
-	if (hasAnyTables && !wroteTables) emitTablesForStory_MD(builder, "" + story.id, tablesByStoryId, emittedTableIds, prettyMarkdown, tableCaptions);
+	if (hasAnyTables) emitTablesForStory_MD(builder, "" + snap.story.id, tablesByStoryId, emittedTableIds, prettyMarkdown, tableCaptions);
 	return builder.str;
 }
 
 /**
- * Exports a story as Markdown to a file.
- * @param {Object} story - InDesign story.
- * @param {Object} outputFile - File object.
- * @param {boolean} preserveNumbering - Preserve markers.
- * @param {boolean} prettyMarkdown - Pretty tables.
- * @param {boolean} tableCaptions - Include table captions/meta.
- */
-function exportStoryAsMarkdown(story, outputFile, preserveNumbering, prettyMarkdown, tableCaptions) {
-	writeStringToFile(outputFile, buildStoryAsMarkdown(story, preserveNumbering, prettyMarkdown, tableCaptions));
-}
-
-/**
- * Builds Plain Text content for a story: paragraphs with list prefixes, tables as TSV.
+ * Builds Plain Text content for a story snapshot: paragraphs with list prefixes, tables as TSV.
  * Simpler than Markdown; uses double newlines for paras, single for lists.
- * @param {Object} story - InDesign story.
+ * @param {Object} snap - Story snapshot.
  * @param {boolean} preserveNumbering - Use actual markers.
  * @param {boolean} tableCaptions - Include table captions/meta.
- * @returns {string} Plain text content.
+ * @returns {string}
  */
-function buildStoryAsPlainText(story, preserveNumbering, tableCaptions) {
+function buildStoryAsPlainText(snap, preserveNumbering, tableCaptions) {
 	var builder = { str: "" };
 
 	var tablesByStoryId = __TABLES_BY_STORY_ID__ || {};
 	var emittedTableIds = __EMITTED_TABLE_IDS__ || {};
 	var hasAnyTables    = !!__ALL_TABLES_INDEX__ && __ALL_TABLES_INDEX__.length > 0;
 
-	var wroteTables = hasAnyTables
-		? emitAllTablesForStory(builder, "" + story.id, tablesByStoryId, emittedTableIds, tableCaptions)
-		: false;
+	for (var i = 0; i < snap.length; i++) {
+		var content = cleanSpecialCharacters(getParaContent(snap, i));
+		if (content.replace(__RE_TRIM__, "").length === 0) continue;
 
-	var paras = story.paragraphs;
-	for (var i = 0; i < paras.length; i++) {
-		var para = paras[i];
-		var content = cleanSpecialCharacters(getContentWithResolvedCrossRefs(para));
-		if (content.replace(/^\s+|\s+$/g, "").length === 0) continue;
-
-		var prev = i > 0 ? paras[i - 1] : null;
-		var next = i < paras.length - 1 ? paras[i + 1] : null;
-		var style = classifyParagraphStyle(para);
-		var structural = isStructuralListItem(para, prev, next);
-		var listPrefix = "";
-
-		if (preserveNumbering && para.bulletsAndNumberingResultText.length > 0) listPrefix = para.bulletsAndNumberingResultText;
+		var style = classifyParagraphStyle(snap, i);
+		var structural = isStructuralListItem(snap, i);
+		var bullet = snap.bullets[i] || "";
+		var hasMarker = bullet.length > 0;
+		var listPrefix = (preserveNumbering && hasMarker) ? bullet : "";
 
 		var line = listPrefix + content.replace(/\r$/, "");
-		var isListItem = (preserveNumbering && para.bulletsAndNumberingResultText.length > 0)
+		var isListItem = (preserveNumbering && hasMarker)
 			|| (!preserveNumbering && (style.type === "bullet" || style.type === "numbered"))
 			|| structural;
 
 		builder.str += isListItem ? (line + "\n") : (line + "\n\n");
 	}
 
-	if (hasAnyTables && !wroteTables) emitAllTablesForStory(builder, "" + story.id, tablesByStoryId, emittedTableIds, tableCaptions);
+	if (hasAnyTables) emitAllTablesForStory(builder, "" + snap.story.id, tablesByStoryId, emittedTableIds, tableCaptions);
 	builder.str = builder.str.replace(/\n+$/, "");
 	return builder.str;
-}
-
-/**
- * Exports a story as Plain Text to a file.
- * @param {Object} story - InDesign story.
- * @param {Object} outputFile - File object.
- * @param {boolean} preserveNumbering - Preserve markers.
- * @param {boolean} tableCaptions - Include table captions/meta.
- */
-function exportStoryAsPlainText(story, outputFile, preserveNumbering, tableCaptions) {
-	writeStringToFile(outputFile, buildStoryAsPlainText(story, preserveNumbering, tableCaptions));
 }
 
 /**
@@ -945,8 +1190,8 @@ function exportRtfOrTaggedAtomic(story, exportFormatConst, outFile, preserveNumb
  * Handles format selection, options, path. Calls exportStories on OK.
  */
 function showExportDialog() {
-	var lastFormat = parseInt(app.extractLabel("exportStories.format"), 10);
-	if (isNaN(lastFormat) || lastFormat < FORMAT_RTF || lastFormat > FORMAT_TAGGED_TEXT) lastFormat = FORMAT_MARKDOWN;
+	var lastFormat = parseIntOr(app.extractLabel("exportStories.format"), FORMAT_MARKDOWN);
+	if (lastFormat < FORMAT_RTF || lastFormat > FORMAT_TAGGED_TEXT) lastFormat = FORMAT_MARKDOWN;
 
 	var lastMinWords = app.extractLabel("exportStories.minWords");
 	if (lastMinWords === "") lastMinWords = "30";
@@ -954,12 +1199,12 @@ function showExportDialog() {
 	if (lastMinSize === "") lastMinSize = "72";
 	var lastPreserve = app.extractLabel("exportStories.preserveNumbering");
 	if (lastPreserve === "") lastPreserve = "1";
-	var lastSingleFile = app.extractLabel("exportStories.singleFile");
-	if (lastSingleFile === "") lastSingleFile = "1";
 	var lastIncludeTables = app.extractLabel("exportStories.includeTables");
 	if (lastIncludeTables === "") lastIncludeTables = "1";
 	var lastTableCaptions = app.extractLabel("exportStories.tableCaptions");
 	if (lastTableCaptions === "") lastTableCaptions = "1";
+	var lastInferHeadings = app.extractLabel("exportStories.inferHeadings");
+	if (lastInferHeadings === "") lastInferHeadings = "0";
 
 	var lastDoc = app.extractLabel("exportStories.lastDoc");
 	var lastPath = app.extractLabel("exportStories.lastPath");
@@ -969,7 +1214,7 @@ function showExportDialog() {
 	}
 
 	var dialog = app.dialogs.add({ name: "Export All Stories" });
-	var formatButtons, preserveCheckbox, singleFileCheckbox, includeTablesCheckbox, tableCaptionsCheckbox, minWordCountField, minFrameSizeField, pathEditbox;
+	var formatButtons, preserveCheckbox, includeTablesCheckbox, tableCaptionsCheckbox, inferHeadingsCheckbox, minWordCountField, minFrameSizeField, pathEditbox;
 	with (dialog) {
 		with (dialogColumns.add()) {
 			with (dialogRows.add()) {
@@ -1020,7 +1265,7 @@ function showExportDialog() {
 					}
 					with (inner.dialogRows.add()) {
 						with (dialogColumns.add()) {
-							singleFileCheckbox = checkboxControls.add({ staticLabel: "Export as single file (Markdown/Plain Text only)", checkedState: lastSingleFile === "1" });
+							inferHeadingsCheckbox = checkboxControls.add({ staticLabel: "Infer headings from text size (Markdown only)", checkedState: lastInferHeadings === "1" });
 						}
 					}
 				}
@@ -1035,34 +1280,28 @@ function showExportDialog() {
 	if (dialog.show()) {
 		var exportFormat = formatButtons.selectedButton;
 		var userPreserveChoice = preserveCheckbox.checkedState;
-		var userSingleFileChoice = singleFileCheckbox.checkedState;
 
 		var isMarkdownOrPlainText = (exportFormat === FORMAT_PLAIN_TEXT || exportFormat === FORMAT_MARKDOWN);
 		var isMarkdown = (exportFormat === FORMAT_MARKDOWN);
 
 		var includeTables = includeTablesCheckbox.checkedState;
 		var tableCaptions = tableCaptionsCheckbox.checkedState;
-
-		// Single-file is meaningless for RTF/Tagged Text. Warn the user up front
-		// rather than silently exporting per-story (or hitting the old dead alert).
-		if (userSingleFileChoice && !isMarkdownOrPlainText) {
-			alert("Single file export only works for Markdown or Plain Text. Exporting per-story instead.");
-		}
+		var userInferHeadingsChoice = inferHeadingsCheckbox.checkedState;
 
 		var preserveNumbering = userPreserveChoice && isMarkdownOrPlainText;
-		var singleFile = userSingleFileChoice && isMarkdownOrPlainText;
 		var prettyMarkdown = isMarkdown; // auto-on for Markdown
+		var inferHeadings = userInferHeadingsChoice && isMarkdown;
 
-		var minWordCount = parseInt(minWordCountField.editContents);
-		var minFrameSize = parseInt(minFrameSizeField.editContents);
+		var minWordCount = parseIntOr(minWordCountField.editContents, 30);
+		var minFrameSize = parseIntOr(minFrameSizeField.editContents, 72);
 		var chosenPath = pathEditbox.editContents;
 
 		// Save preferences
 		app.insertLabel("exportStories.format", exportFormat.toString());
 		app.insertLabel("exportStories.preserveNumbering", userPreserveChoice ? "1" : "0");
-		app.insertLabel("exportStories.singleFile", userSingleFileChoice ? "1" : "0");
 		app.insertLabel("exportStories.includeTables", includeTables ? "1" : "0");
 		app.insertLabel("exportStories.tableCaptions", tableCaptions ? "1" : "0");
+		app.insertLabel("exportStories.inferHeadings", userInferHeadingsChoice ? "1" : "0");
 		app.insertLabel("exportStories.minWords", minWordCountField.editContents);
 		app.insertLabel("exportStories.minFrameSize", minFrameSizeField.editContents);
 		app.insertLabel("exportStories.lastDoc", docName);
@@ -1078,7 +1317,7 @@ function showExportDialog() {
 		}
 
 		if (app.activeDocument.stories.length !== 0) {
-			exportStories(exportFormat, outFolder, minWordCount, minFrameSize, preserveNumbering, singleFile, includeTables, prettyMarkdown, tableCaptions);
+			exportStories(exportFormat, outFolder, minWordCount, minFrameSize, preserveNumbering, includeTables, prettyMarkdown, tableCaptions, inferHeadings);
 		}
 	} else {
 		dialog.destroy();
@@ -1093,12 +1332,11 @@ function showExportDialog() {
  * @param {number} minWordCount - Min words filter.
  * @param {number} minFrameSize - Min frame size filter.
  * @param {boolean} preserveNumbering - Preserve lists.
- * @param {boolean} singleFile - Single file mode.
  * @param {boolean} includeTables - Export tables.
  * @param {boolean} prettyMarkdown - Pretty MD tables.
  * @param {boolean} tableCaptions - Include table captions/meta.
  */
-function exportStories(exportFormat, targetFolder, minWordCount, minFrameSize, preserveNumbering, singleFile, includeTables, prettyMarkdown, tableCaptions) {
+function exportStories(exportFormat, targetFolder, minWordCount, minFrameSize, preserveNumbering, includeTables, prettyMarkdown, tableCaptions, inferHeadings) {
 	var exportedCount = 0, skippedCount = 0, failedCount = 0;
 	var isMarkdown  = (exportFormat === FORMAT_MARKDOWN);
 	var isPlainText = (exportFormat === FORMAT_PLAIN_TEXT);
@@ -1114,9 +1352,12 @@ function exportStories(exportFormat, targetFolder, minWordCount, minFrameSize, p
 		__EMITTED_TABLE_IDS__  = {};
 	}
 
+	// Walk stories in reading order (doc.stories returns creation order, which jumbles output).
+	var orderedStories = collectStoriesInReadingOrder(app.activeDocument);
+
 	// Filter stories: skip TOC, pasteboard/small frames, short stories (unless tables)
-	for (var i = 0; i < app.activeDocument.stories.length; i++) {
-		var story = app.activeDocument.stories.item(i);
+	for (var i = 0; i < orderedStories.length; i++) {
+		var story = orderedStories[i];
 		if (story.storyType == StoryTypes.TOC_STORY) {
 			continue;
 		}
@@ -1149,64 +1390,62 @@ function exportStories(exportFormat, targetFolder, minWordCount, minFrameSize, p
 		storiesToProcess.push(story);
 	}
 
-	if (singleFile && (isMarkdown || isPlainText)) {
+	var docName = sanitizeFilename(app.activeDocument.name.replace(/\.indd$/i, ""), "Document");
+
+	if (isMarkdown || isPlainText) {
+		// Always consolidate Markdown / Plain Text into a single file -- one document
+		// per InDesign doc is the only thing anyone has ever wanted from this script.
+		// Build per-story snapshots once so the size-map and the build loops share work.
+		var snapshots = [];
+		for (var sn = 0; sn < storiesToProcess.length; sn++) {
+			try { snapshots.push(getStoryParaSnapshot(storiesToProcess[sn])); }
+			catch (eSn) { snapshots.push(null); }
+		}
+
+		var validSnaps = [];
+		for (var v = 0; v < snapshots.length; v++) if (snapshots[v]) validSnaps.push(snapshots[v]);
+		__HEADING_SIZE_LEVELS__ = inferHeadings ? buildHeadingSizeMap(validSnaps) : null;
+
 		var bigBuilder = { str: "" };
-		for (var s = 0; s < storiesToProcess.length; s++) {
-			var st = storiesToProcess[s];
+		for (var s = 0; s < snapshots.length; s++) {
+			var snap = snapshots[s];
+			if (!snap) { failedCount++; continue; }
 			try {
-				if (s > 0) bigBuilder.str += "\n\n--------\n\n";
-				if (isMarkdown) bigBuilder.str += buildStoryAsMarkdown(st, preserveNumbering, prettyMarkdown, tableCaptions);
-				else bigBuilder.str += buildStoryAsPlainText(st, preserveNumbering, tableCaptions);
+				if (bigBuilder.str.length > 0) bigBuilder.str += "\n\n--------\n\n";
+				if (isMarkdown) bigBuilder.str += buildStoryAsMarkdown(snap, preserveNumbering, prettyMarkdown, tableCaptions);
+				else bigBuilder.str += buildStoryAsPlainText(snap, preserveNumbering, tableCaptions);
 				exportedCount++;
 			} catch(eS) { failedCount++; }
 		}
 
 		if (includeTables) appendStandaloneTablesBlock(bigBuilder, isMarkdown, prettyMarkdown, tableCaptions, 2);
 
-		var docName = app.activeDocument.name.replace(/\.indd$/i, "");
 		var ext = isMarkdown ? ".md" : ".txt";
 		var out = new File(targetFolder + "/" + docName + "_all_stories" + ext);
 		var c = 1; while (out.exists) { out = new File(targetFolder + "/" + docName + "_all_stories_" + c + ext); c++; }
 		writeStringToFile(out, bigBuilder.str);
 
 	} else {
+		// RTF / Tagged Text: per-story export (InDesign's exportFile is the only way
+		// to preserve native styling, and it writes one story per file).
+		__HEADING_SIZE_LEVELS__ = null;
 		for (var idx = 0; idx < storiesToProcess.length; idx++) {
 			var story2 = storiesToProcess[idx];
 			try {
-				var fileName = "";
-				if (story2.words.length > 0) { var wc = Math.min(5, story2.words.length); for (var w = 0; w < wc; w++) fileName += story2.words[w].contents + " "; }
-				fileName = fileName.replace(/^\s+|\s+$/g, "");
-				var illegal = ["/", "\\", ":", "*", "?", "\"", "<", ">", "|"]; for (var k = 0; k < illegal.length; k++) fileName = fileName.split(illegal[k]).join("");
-				fileName = fileName.substring(0, 60);
-				if (fileName === "") fileName = "Story_" + story2.id;
+				var rawName = "";
+				if (story2.words.length > 0) {
+					var wc = Math.min(5, story2.words.length);
+					for (var w = 0; w < wc; w++) rawName += story2.words[w].contents + " ";
+				}
+				var fileName = sanitizeFilename(rawName, "Story_" + story2.id);
 
-				var extension;
-				if (isMarkdown) extension = ".md";
-				else if (isPlainText) extension = ".txt";
-				else if (exportFormat === FORMAT_RTF) extension = ".rtf";
-				else extension = ".txt"; // FORMAT_TAGGED_TEXT
-
+				var extension = (exportFormat === FORMAT_RTF) ? ".rtf" : ".txt";
 				var outFile = new File(targetFolder + "/" + fileName + extension);
 				var counter = 1; while (outFile.exists) { outFile = new File(targetFolder + "/" + fileName + "_" + counter + extension); counter++; }
 
-				if (isMarkdown) exportStoryAsMarkdown(story2, outFile, preserveNumbering, prettyMarkdown, tableCaptions);
-				else if (isPlainText) exportStoryAsPlainText(story2, outFile, preserveNumbering, tableCaptions);
-				else exportRtfOrTaggedAtomic(story2, exportFormat, outFile, preserveNumbering);
-
+				exportRtfOrTaggedAtomic(story2, exportFormat, outFile, preserveNumbering);
 				exportedCount++;
 			} catch(eStory) { failedCount++; }
-		}
-
-		if (includeTables && (isMarkdown || isPlainText) && __ALL_TABLES_INDEX__.length > 0) {
-			var stBuilder = { str: "" };
-			var any = appendStandaloneTablesBlock(stBuilder, isMarkdown, prettyMarkdown, tableCaptions, 1);
-			if (any) {
-				var docName2 = app.activeDocument.name.replace(/\.indd$/i, "");
-				var ext2 = isMarkdown ? ".md" : ".txt";
-				var stFile = new File(targetFolder + "/" + docName2 + "_standalone_tables" + ext2);
-				var cc = 1; while (stFile.exists) { stFile = new File(targetFolder + "/" + docName2 + "_standalone_tables_" + cc + ext2); cc++; }
-				writeStringToFile(stFile, stBuilder.str);
-			}
 		}
 	}
 
