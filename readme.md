@@ -84,4 +84,4 @@ The script keeps the original InDesign document unchanged and generates a minima
 
 ## License
 
-MIT License. See `license.md` and the [Adobe Developer Console](https://developer.adobe.com/indesign/) for details
+MIT License. See `license.md` for details. The script derives from Adobe's original `ExportAllStories.jsx`, distributed under the [Adobe SDK license](https://developer.adobe.com/indesign/).
